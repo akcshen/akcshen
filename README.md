@@ -1,8 +1,8 @@
-1### Hi there 👋
-2
-3🤓 I'm kcshen, a Content Strategist | Senior Technical Writer.
-4
-5I love photography 📷, traveling ✈️, cooking and enjoying delicious food 🥘
-6
-7And I love fruit very much. 🍎 🍓 🥭 🥝
-8
+### 🐼Me
+
+大家好，我是`KC(Casie)`,一名热衷于前端开发的工程师，我的追求：`工作开心不加班，生活快乐无忧虑`
+
+I love photography 📷, traveling ✈️, cooking and enjoying delicious food 🥘
+
+And I love fruit very much. 🍎 🍓 🥭 🥝
+

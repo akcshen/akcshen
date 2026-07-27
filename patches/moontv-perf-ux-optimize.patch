@@ -1,0 +1,1374 @@
+From 853d629eda051e38ceb7ebc9738a91cf857acca1 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Mon, 27 Jul 2026 07:46:36 +0000
+Subject: [PATCH] =?UTF-8?q?perf:=20=E4=BC=98=E5=8C=96=E6=90=9C=E7=B4=A2/?=
+ =?UTF-8?q?=E6=92=AD=E6=94=BE=E6=80=A7=E8=83=BD=E4=B8=8E=E7=A7=BB=E5=8A=A8?=
+ =?UTF-8?q?=E7=AB=AF=E4=BD=93=E9=AA=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 动态加载 ArtPlayer/HLS，列表页不再打入播放器依赖
+- 搜索支持 lite 模式（首屏更快、响应更小）并避免重复请求
+- 播放页 source+id 快路径直拉详情，缩短就绪等待
+- 卡片骨架屏、触摸端操作可见、底栏与留白体验修复
+---
+ VERSION.txt                         |   2 +-
+ src/app/api/search/route.ts         |  27 ++--
+ src/app/globals.css                 |  34 +++++
+ src/app/loading.tsx                 |  21 +++
+ src/app/play/page.tsx               | 229 ++++++++++++++++++----------
+ src/app/search/loading.tsx          |  21 +++
+ src/app/search/page.tsx             | 132 ++++++++--------
+ src/components/EpisodeSelector.tsx  |  10 +-
+ src/components/ImagePlaceholder.tsx |  38 +----
+ src/components/MobileBottomNav.tsx  |   8 +-
+ src/components/PageLayout.tsx       |   9 +-
+ src/components/UserMenu.tsx         |   4 +
+ src/components/VideoCard.tsx        |  30 ++--
+ src/lib/downstream.ts               | 137 ++++++++---------
+ src/lib/types.ts                    |   2 +
+ src/lib/utils.ts                    |  40 ++++-
+ src/lib/version.ts                  |   2 +-
+ 17 files changed, 452 insertions(+), 294 deletions(-)
+ create mode 100644 src/app/loading.tsx
+ create mode 100644 src/app/search/loading.tsx
+
+diff --git a/VERSION.txt b/VERSION.txt
+index ef046ac..0e61d33 100644
+--- a/VERSION.txt
++++ b/VERSION.txt
+@@ -1 +1 @@
+-20250804231933
+\ No newline at end of file
++20260727074636
+\ No newline at end of file
+diff --git a/src/app/api/search/route.ts b/src/app/api/search/route.ts
+index fca4958..392f0e4 100644
+--- a/src/app/api/search/route.ts
++++ b/src/app/api/search/route.ts
+@@ -9,6 +9,8 @@ export const runtime = 'edge';
+ export async function GET(request: Request) {
+   const { searchParams } = new URL(request.url);
+   const query = searchParams.get('q');
++  // lite=1：浏览搜索（首屏更快、体积更小）；播放页聚合源请勿传 lite
++  const lite = searchParams.get('lite') === '1';
+ 
+   if (!query) {
+     const cacheTime = await getCacheTime();
+@@ -16,9 +18,9 @@ export async function GET(request: Request) {
+       { results: [] },
+       {
+         headers: {
+-          'Cache-Control': `public, max-age=${cacheTime}, s-maxage=${cacheTime}`,
+-          'CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
+-          'Vercel-CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
++          'Cache-Control': `public, max-age=${cacheTime}, s-maxage=${cacheTime}, stale-while-revalidate=60`,
++          'CDN-Cache-Control': `public, s-maxage=${cacheTime}, stale-while-revalidate=60`,
++          'Vercel-CDN-Cache-Control': `public, s-maxage=${cacheTime}, stale-while-revalidate=60`,
+         },
+       }
+     );
+@@ -26,11 +28,16 @@ export async function GET(request: Request) {
+ 
+   const config = await getConfig();
+   const apiSites = config.SourceConfig.filter((site) => !site.disabled);
+-  const searchPromises = apiSites.map((site) => searchFromApi(site, query));
++  const searchPromises = apiSites.map((site) =>
++    searchFromApi(site, query, { lite })
++  );
+ 
+   try {
+-    const results = await Promise.all(searchPromises);
+-    let flattenedResults = results.flat();
++    // allSettled：单个源异常不影响整体返回
++    const settled = await Promise.allSettled(searchPromises);
++    let flattenedResults = settled.flatMap((result) =>
++      result.status === 'fulfilled' ? result.value : []
++    );
+     if (!config.SiteConfig.DisableYellowFilter) {
+       flattenedResults = flattenedResults.filter((result) => {
+         const typeName = result.type_name || '';
+@@ -38,14 +45,16 @@ export async function GET(request: Request) {
+       });
+     }
+     const cacheTime = await getCacheTime();
++    // 浏览搜索结果更容易过期，使用较短 CDN TTL + SWR
++    const listCacheTime = lite ? Math.min(cacheTime, 600) : cacheTime;
+ 
+     return NextResponse.json(
+       { results: flattenedResults },
+       {
+         headers: {
+-          'Cache-Control': `public, max-age=${cacheTime}, s-maxage=${cacheTime}`,
+-          'CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
+-          'Vercel-CDN-Cache-Control': `public, s-maxage=${cacheTime}`,
++          'Cache-Control': `public, max-age=${listCacheTime}, s-maxage=${listCacheTime}, stale-while-revalidate=120`,
++          'CDN-Cache-Control': `public, s-maxage=${listCacheTime}, stale-while-revalidate=120`,
++          'Vercel-CDN-Cache-Control': `public, s-maxage=${listCacheTime}, stale-while-revalidate=120`,
+         },
+       }
+     );
+diff --git a/src/app/globals.css b/src/app/globals.css
+index ba4907b..0b8901a 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -15,6 +15,40 @@
+ 
+ :root {
+   --foreground-rgb: 255, 255, 255;
++  --skeleton-color: #f0f0f0;
++  --skeleton-highlight: #e0e0e0;
++}
++
++.dark {
++  --skeleton-color: #2d2d2d;
++  --skeleton-highlight: #3d3d3d;
++}
++
++@media (prefers-color-scheme: dark) {
++  :root:not(.light) {
++    --skeleton-color: #2d2d2d;
++    --skeleton-highlight: #3d3d3d;
++  }
++}
++
++@keyframes shine {
++  0% {
++    background-position: -200% 0;
++  }
++  100% {
++    background-position: 200% 0;
++  }
++}
++
++.image-placeholder {
++  background: linear-gradient(
++    90deg,
++    var(--skeleton-color) 25%,
++    var(--skeleton-highlight) 50%,
++    var(--skeleton-color) 75%
++  );
++  background-size: 200% 100%;
++  animation: shine 1.5s infinite;
+ }
+ 
+ html,
+diff --git a/src/app/loading.tsx b/src/app/loading.tsx
+new file mode 100644
+index 0000000..4146a64
+--- /dev/null
++++ b/src/app/loading.tsx
+@@ -0,0 +1,21 @@
++import DoubanCardSkeleton from '@/components/DoubanCardSkeleton';
++import PageLayout from '@/components/PageLayout';
++
++export default function HomeLoading() {
++  return (
++    <PageLayout>
++      <div className='px-2 sm:px-10 py-4 sm:py-8 overflow-visible'>
++        <div className='mb-8'>
++          <div className='h-8 w-40 bg-gray-200 dark:bg-gray-800 rounded animate-pulse mb-4' />
++          <div className='flex gap-4 overflow-hidden'>
++            {Array.from({ length: 6 }).map((_, index) => (
++              <div key={index} className='w-36 flex-shrink-0'>
++                <DoubanCardSkeleton />
++              </div>
++            ))}
++          </div>
++        </div>
++      </div>
++    </PageLayout>
++  );
++}
+diff --git a/src/app/play/page.tsx b/src/app/play/page.tsx
+index 790b4f3..1fd6071 100644
+--- a/src/app/play/page.tsx
++++ b/src/app/play/page.tsx
+@@ -2,8 +2,6 @@
+ 
+ 'use client';
+ 
+-import Artplayer from 'artplayer';
+-import Hls from 'hls.js';
+ import { Heart } from 'lucide-react';
+ import { useRouter, useSearchParams } from 'next/navigation';
+ import { Suspense, useEffect, useRef, useState } from 'react';
+@@ -22,7 +20,11 @@ import {
+   subscribeToDataUpdates,
+ } from '@/lib/db.client';
+ import { SearchResult } from '@/lib/types';
+-import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
++import {
++  getEpisodeCount,
++  getVideoResolutionFromM3u8,
++  processImageUrl,
++} from '@/lib/utils';
+ 
+ import EpisodeSelector from '@/components/EpisodeSelector';
+ import PageLayout from '@/components/PageLayout';
+@@ -34,6 +36,10 @@ declare global {
+   }
+ }
+ 
++// ArtPlayer / HLS 动态加载，避免进入播放页前就打包进主包
++type ArtplayerConstructor = any;
++type HlsConstructor = any;
++
+ function PlayPageClient() {
+   const router = useRouter();
+   const searchParams = useSearchParams();
+@@ -193,26 +199,54 @@ function PlayPageClient() {
+ 
+   const artPlayerRef = useRef<any>(null);
+   const artRef = useRef<HTMLDivElement | null>(null);
++  const [Artplayer, setArtplayer] = useState<ArtplayerConstructor | null>(null);
++  const [Hls, setHls] = useState<HlsConstructor | null>(null);
++
++  // 动态加载播放器依赖
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      try {
++        const [{ default: Art }, { default: HlsModule }] = await Promise.all([
++          import('artplayer'),
++          import('hls.js'),
++        ]);
++        if (!cancelled) {
++          setArtplayer(() => Art);
++          setHls(() => HlsModule);
++        }
++      } catch (err) {
++        console.error('加载播放器依赖失败:', err);
++        if (!cancelled) {
++          setError('播放器加载失败，请刷新重试');
++        }
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, []);
+ 
+   // -----------------------------------------------------------------------------
+   // 工具函数（Utils）
+   // -----------------------------------------------------------------------------
+ 
+-  // 播放源优选函数
++  // 播放源优选函数：限制测速数量，降低移动端压力
+   const preferBestSource = async (
+     sources: SearchResult[]
+   ): Promise<SearchResult> => {
+     if (sources.length === 1) return sources[0];
+ 
+-    // 将播放源均分为两批，并发测速各批，避免一次性过多请求
+-    const batchSize = Math.ceil(sources.length / 2);
++    // 最多测速前 6 个源，避免一次性创建过多 HLS 实例
++    const candidates = sources.slice(0, 6);
++    const batchSize = Math.min(3, candidates.length);
+     const allResults: Array<{
+       source: SearchResult;
+       testResult: { quality: string; loadSpeed: string; pingTime: number };
+     } | null> = [];
+ 
+-    for (let start = 0; start < sources.length; start += batchSize) {
+-      const batchSources = sources.slice(start, start + batchSize);
++    for (let start = 0; start < candidates.length; start += batchSize) {
++      const batchSources = candidates.slice(start, start + batchSize);
+       const batchResults = await Promise.all(
+         batchSources.map(async (source) => {
+           try {
+@@ -252,7 +286,8 @@ function PlayPageClient() {
+       }
+     >();
+     allResults.forEach((result, index) => {
+-      const source = sources[index];
++      const source = result?.source || candidates[index];
++      if (!source) return;
+       const sourceKey = `${source.source}-${source.id}`;
+ 
+       if (result) {
+@@ -558,42 +593,14 @@ function PlayPageClient() {
+     }
+   };
+ 
+-  class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
+-    constructor(config: any) {
+-      super(config);
+-      const load = this.load.bind(this);
+-      this.load = function (context: any, config: any, callbacks: any) {
+-        // 拦截manifest和level请求
+-        if (
+-          (context as any).type === 'manifest' ||
+-          (context as any).type === 'level'
+-        ) {
+-          const onSuccess = callbacks.onSuccess;
+-          callbacks.onSuccess = function (
+-            response: any,
+-            stats: any,
+-            context: any
+-          ) {
+-            // 如果是m3u8文件，处理内容以移除广告分段
+-            if (response.data && typeof response.data === 'string') {
+-              // 过滤掉广告段 - 实现更精确的广告过滤逻辑
+-              response.data = filterAdsFromM3U8(response.data);
+-            }
+-            return onSuccess(response, stats, context, null);
+-          };
+-        }
+-        // 执行原始load方法
+-        load(context, config, callbacks);
+-      };
+-    }
+-  }
++  // CustomHlsJsLoader 在播放器初始化时基于已加载的 Hls 动态创建
+ 
+   // 当集数索引变化时自动更新视频地址
+   useEffect(() => {
+     updateVideoUrl(detail, currentEpisodeIndex);
+   }, [detail, currentEpisodeIndex]);
+ 
+-  // 进入页面时直接获取全部源信息
++  // 进入页面时初始化播放详情
+   useEffect(() => {
+     const fetchSourceDetail = async (
+       source: string,
+@@ -607,7 +614,12 @@ function PlayPageClient() {
+           throw new Error('获取视频详情失败');
+         }
+         const detailData = (await detailResponse.json()) as SearchResult;
+-        setAvailableSources([detailData]);
++        setAvailableSources((prev) => {
++          const exists = prev.some(
++            (item) => item.source === source && item.id === id
++          );
++          return exists ? prev : [detailData, ...prev];
++        });
+         return [detailData];
+       } catch (err) {
+         console.error('获取视频详情失败:', err);
+@@ -617,7 +629,7 @@ function PlayPageClient() {
+       }
+     };
+     const fetchSourcesData = async (query: string): Promise<SearchResult[]> => {
+-      // 根据搜索词获取全部源信息
++      // 根据搜索词获取全部源信息（播放页需要完整剧集地址，不使用 lite）
+       try {
+         const response = await fetch(
+           `/api/search?q=${encodeURIComponent(query.trim())}`
+@@ -636,8 +648,8 @@ function PlayPageClient() {
+               ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
+               : true) &&
+             (searchType
+-              ? (searchType === 'tv' && result.episodes.length > 1) ||
+-                (searchType === 'movie' && result.episodes.length === 1)
++              ? (searchType === 'tv' && getEpisodeCount(result) > 1) ||
++                (searchType === 'movie' && getEpisodeCount(result) === 1)
+               : true)
+         );
+         setAvailableSources(results);
+@@ -665,46 +677,76 @@ function PlayPageClient() {
+           : '🔍 正在搜索播放源...'
+       );
+ 
+-      let sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
+-      if (
+-        currentSource &&
+-        currentId &&
+-        !sourcesInfo.some(
+-          (source) => source.source === currentSource && source.id === currentId
+-        )
+-      ) {
+-        sourcesInfo = await fetchSourceDetail(currentSource, currentId);
+-      }
+-      if (sourcesInfo.length === 0) {
+-        setError('未找到匹配结果');
+-        setLoading(false);
+-        return;
+-      }
++      let sourcesInfo: SearchResult[] = [];
++      let detailData: SearchResult | null = null;
+ 
+-      let detailData: SearchResult = sourcesInfo[0];
+-      // 指定源和id且无需优选
++      // 快路径：已指定 source+id 且无需优选时，直接拉详情开播，后台再聚合其他源
+       if (currentSource && currentId && !needPreferRef.current) {
+-        const target = sourcesInfo.find(
+-          (source) => source.source === currentSource && source.id === currentId
+-        );
+-        if (target) {
+-          detailData = target;
+-        } else {
++        sourcesInfo = await fetchSourceDetail(currentSource, currentId);
++        if (sourcesInfo.length === 0) {
++          setError('未找到匹配结果');
++          setLoading(false);
++          return;
++        }
++        detailData = sourcesInfo[0];
++
++        // 后台补充其他播放源，不阻塞首帧
++        const backgroundQuery = searchTitle || videoTitle;
++        if (backgroundQuery) {
++          fetchSourcesData(backgroundQuery).catch(() => {
++            /* ignore background errors */
++          });
++        }
++      } else {
++        sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
++        if (
++          currentSource &&
++          currentId &&
++          !sourcesInfo.some(
++            (source) =>
++              source.source === currentSource && source.id === currentId
++          )
++        ) {
++          sourcesInfo = await fetchSourceDetail(currentSource, currentId);
++        }
++        if (sourcesInfo.length === 0) {
+           setError('未找到匹配结果');
+           setLoading(false);
+           return;
+         }
+-      }
+ 
+-      // 未指定源和 id 或需要优选，且开启优选开关
+-      if (
+-        (!currentSource || !currentId || needPreferRef.current) &&
+-        optimizationEnabled
+-      ) {
+-        setLoadingStage('preferring');
+-        setLoadingMessage('⚡ 正在优选最佳播放源...');
++        detailData = sourcesInfo[0];
++        // 指定源和id且无需优选
++        if (currentSource && currentId && !needPreferRef.current) {
++          const target = sourcesInfo.find(
++            (source) =>
++              source.source === currentSource && source.id === currentId
++          );
++          if (target) {
++            detailData = target;
++          } else {
++            setError('未找到匹配结果');
++            setLoading(false);
++            return;
++          }
++        }
+ 
+-        detailData = await preferBestSource(sourcesInfo);
++        // 未指定源和 id 或需要优选，且开启优选开关
++        if (
++          (!currentSource || !currentId || needPreferRef.current) &&
++          optimizationEnabled
++        ) {
++          setLoadingStage('preferring');
++          setLoadingMessage('⚡ 正在优选最佳播放源...');
++
++          detailData = await preferBestSource(sourcesInfo);
++        }
++      }
++
++      if (!detailData) {
++        setError('未找到匹配结果');
++        setLoading(false);
++        return;
+       }
+ 
+       console.log(detailData.source, detailData.id);
+@@ -732,10 +774,10 @@ function PlayPageClient() {
+       setLoadingStage('ready');
+       setLoadingMessage('✨ 准备就绪，即将开始播放...');
+ 
+-      // 短暂延迟让用户看到完成状态
++      // 缩短就绪提示，尽快进入播放
+       setTimeout(() => {
+         setLoading(false);
+-      }, 1000);
++      }, 200);
+     };
+ 
+     initAll();
+@@ -1221,6 +1263,37 @@ function PlayPageClient() {
+     }
+ 
+     try {
++      // 基于已加载的 Hls 创建去广告 Loader
++      class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
++        constructor(config: any) {
++          super(config);
++          const load = this.load.bind(this);
++          this.load = function (context: any, config: any, callbacks: any) {
++            // 拦截manifest和level请求
++            if (
++              (context as any).type === 'manifest' ||
++              (context as any).type === 'level'
++            ) {
++              const onSuccess = callbacks.onSuccess;
++              callbacks.onSuccess = function (
++                response: any,
++                stats: any,
++                context: any
++              ) {
++                // 如果是m3u8文件，处理内容以移除广告分段
++                if (response.data && typeof response.data === 'string') {
++                  // 过滤掉广告段 - 实现更精确的广告过滤逻辑
++                  response.data = filterAdsFromM3U8(response.data);
++                }
++                return onSuccess(response, stats, context, null);
++              };
++            }
++            // 执行原始load方法
++            load(context, config, callbacks);
++          };
++        }
++      }
++
+       // 创建新的播放器实例
+       Artplayer.PLAYBACK_RATE = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
+       Artplayer.USE_RAF = true;
+@@ -1348,7 +1421,7 @@ function PlayPageClient() {
+             name: '跳过片头片尾',
+             html: '跳过片头片尾',
+             switch: skipConfigRef.current.enable,
+-            onSwitch: function (item) {
++            onSwitch: function (item: { switch: boolean }) {
+               const newConfig = {
+                 ...skipConfigRef.current,
+                 enable: !item.switch,
+diff --git a/src/app/search/loading.tsx b/src/app/search/loading.tsx
+new file mode 100644
+index 0000000..292e5c1
+--- /dev/null
++++ b/src/app/search/loading.tsx
+@@ -0,0 +1,21 @@
++import DoubanCardSkeleton from '@/components/DoubanCardSkeleton';
++import PageLayout from '@/components/PageLayout';
++
++export default function SearchLoading() {
++  return (
++    <PageLayout activePath='/search'>
++      <div className='px-4 sm:px-10 py-4 sm:py-8 overflow-visible mb-10'>
++        <div className='mb-8'>
++          <div className='max-w-2xl mx-auto h-12 rounded-lg bg-gray-200/80 dark:bg-gray-800 animate-pulse' />
++        </div>
++        <div className='max-w-[95%] mx-auto mt-12'>
++          <div className='justify-start grid grid-cols-3 gap-x-2 gap-y-14 sm:gap-y-20 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,_minmax(11rem,_1fr))] sm:gap-x-8'>
++            {Array.from({ length: 12 }).map((_, index) => (
++              <DoubanCardSkeleton key={index} />
++            ))}
++          </div>
++        </div>
++      </div>
++    </PageLayout>
++  );
++}
+diff --git a/src/app/search/page.tsx b/src/app/search/page.tsx
+index 34b289c..c9859e9 100644
+--- a/src/app/search/page.tsx
++++ b/src/app/search/page.tsx
+@@ -3,7 +3,7 @@
+ 
+ import { ChevronUp, Search, X } from 'lucide-react';
+ import { useRouter, useSearchParams } from 'next/navigation';
+-import { Suspense, useEffect, useMemo, useState } from 'react';
++import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+ 
+ import {
+   addSearchHistory,
+@@ -13,8 +13,10 @@ import {
+   subscribeToDataUpdates,
+ } from '@/lib/db.client';
+ import { SearchResult } from '@/lib/types';
++import { getEpisodeCount } from '@/lib/utils';
+ import { yellowWords } from '@/lib/yellow';
+ 
++import DoubanCardSkeleton from '@/components/DoubanCardSkeleton';
+ import PageLayout from '@/components/PageLayout';
+ import VideoCard from '@/components/VideoCard';
+ 
+@@ -30,6 +32,7 @@ function SearchPageClient() {
+   const [isLoading, setIsLoading] = useState(false);
+   const [showResults, setShowResults] = useState(false);
+   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
++  const abortControllerRef = useRef<AbortController | null>(null);
+ 
+   // 获取默认聚合设置：只读取用户本地设置，默认为 true
+   const getDefaultAggregate = () => {
+@@ -50,10 +53,11 @@ function SearchPageClient() {
+   const aggregatedResults = useMemo(() => {
+     const map = new Map<string, SearchResult[]>();
+     searchResults.forEach((item) => {
++      const episodeCount = getEpisodeCount(item);
+       // 使用 title + year + type 作为键，year 必然存在，但依然兜底 'unknown'
+       const key = `${item.title.replaceAll(' ', '')}-${
+         item.year || 'unknown'
+-      }-${item.episodes.length === 1 ? 'movie' : 'tv'}`;
++      }-${episodeCount === 1 ? 'movie' : 'tv'}`;
+       const arr = map.get(key) || [];
+       arr.push(item);
+       map.set(key, arr);
+@@ -90,7 +94,7 @@ function SearchPageClient() {
+         }
+       }
+     });
+-  }, [searchResults]);
++  }, [searchResults, searchQuery]);
+ 
+   useEffect(() => {
+     // 无搜索参数时聚焦搜索框
+@@ -112,61 +116,51 @@ function SearchPageClient() {
+       return document.body.scrollTop || 0;
+     };
+ 
+-    // 使用 requestAnimationFrame 持续检测滚动位置
+-    let isRunning = false;
+-    const checkScrollPosition = () => {
+-      if (!isRunning) return;
+-
+-      const scrollTop = getScrollTop();
+-      const shouldShow = scrollTop > 300;
+-      setShowBackToTop(shouldShow);
+-
+-      requestAnimationFrame(checkScrollPosition);
+-    };
+-
+-    // 启动持续检测
+-    isRunning = true;
+-    checkScrollPosition();
+-
+-    // 监听 body 元素的滚动事件
++    // 监听 body 元素的滚动事件（避免 rAF 常驻循环耗电）
+     const handleScroll = () => {
+       const scrollTop = getScrollTop();
+       setShowBackToTop(scrollTop > 300);
+     };
+ 
+     document.body.addEventListener('scroll', handleScroll, { passive: true });
++    handleScroll();
+ 
+     return () => {
+       unsubscribe();
+-      isRunning = false; // 停止 requestAnimationFrame 循环
+-
+-      // 移除 body 滚动事件监听器
+       document.body.removeEventListener('scroll', handleScroll);
++      abortControllerRef.current?.abort();
+     };
+   }, []);
+ 
+   useEffect(() => {
+-    // 当搜索参数变化时更新搜索状态
++    // 当搜索参数变化时更新搜索状态（唯一请求入口，避免与提交时双发）
+     const query = searchParams.get('q');
+     if (query) {
+       setSearchQuery(query);
++      setIsLoading(true);
++      setShowResults(true);
+       fetchSearchResults(query);
+-
+-      // 保存到搜索历史 (事件监听会自动更新界面)
+       addSearchHistory(query);
+     } else {
+       setShowResults(false);
++      setIsLoading(false);
++      setSearchResults([]);
+     }
+   }, [searchParams]);
+ 
+   const fetchSearchResults = async (query: string) => {
++    abortControllerRef.current?.abort();
++    const controller = new AbortController();
++    abortControllerRef.current = controller;
++
+     try {
+       setIsLoading(true);
+       const response = await fetch(
+-        `/api/search?q=${encodeURIComponent(query.trim())}`
++        `/api/search?q=${encodeURIComponent(query.trim())}&lite=1`,
++        { signal: controller.signal }
+       );
+       const data = await response.json();
+-      let results = data.results;
++      let results = data.results || [];
+       if (
+         typeof window !== 'undefined' &&
+         !(window as any).RUNTIME_CONFIG?.DISABLE_YELLOW_FILTER
+@@ -205,9 +199,12 @@ function SearchPageClient() {
+       );
+       setShowResults(true);
+     } catch (error) {
++      if ((error as Error)?.name === 'AbortError') return;
+       setSearchResults([]);
+     } finally {
+-      setIsLoading(false);
++      if (!controller.signal.aborted) {
++        setIsLoading(false);
++      }
+     }
+   };
+ 
+@@ -216,17 +213,12 @@ function SearchPageClient() {
+     const trimmed = searchQuery.trim().replace(/\s+/g, ' ');
+     if (!trimmed) return;
+ 
+-    // 回显搜索框
++    // 回显搜索框；请求仅由 searchParams effect 触发
+     setSearchQuery(trimmed);
+     setIsLoading(true);
+     setShowResults(true);
+ 
+     router.push(`/search?q=${encodeURIComponent(trimmed)}`);
+-    // 直接发请求
+-    fetchSearchResults(trimmed);
+-
+-    // 保存到搜索历史 (事件监听会自动更新界面)
+-    addSearchHistory(trimmed);
+   };
+ 
+   // 返回顶部功能
+@@ -266,9 +258,18 @@ function SearchPageClient() {
+         {/* 搜索结果或搜索历史 */}
+         <div className='max-w-[95%] mx-auto mt-12 overflow-visible'>
+           {isLoading ? (
+-            <div className='flex justify-center items-center h-40'>
+-              <div className='animate-spin rounded-full h-8 w-8 border-b-2 border-green-500'></div>
+-            </div>
++            <section className='mb-12'>
++              <div className='mb-8 flex items-center justify-between'>
++                <h2 className='text-xl font-bold text-gray-800 dark:text-gray-200'>
++                  搜索中...
++                </h2>
++              </div>
++              <div className='justify-start grid grid-cols-3 gap-x-2 gap-y-14 sm:gap-y-20 px-0 sm:px-2 sm:grid-cols-[repeat(auto-fill,_minmax(11rem,_1fr))] sm:gap-x-8'>
++                {Array.from({ length: 12 }).map((_, index) => (
++                  <DoubanCardSkeleton key={index} />
++                ))}
++              </div>
++            </section>
+           ) : showResults ? (
+             <section className='mb-12'>
+               {/* 标题 + 聚合开关 */}
+@@ -315,30 +316,33 @@ function SearchPageClient() {
+                         </div>
+                       );
+                     })
+-                  : searchResults.map((item) => (
+-                      <div
+-                        key={`all-${item.source}-${item.id}`}
+-                        className='w-full'
+-                      >
+-                        <VideoCard
+-                          id={item.id}
+-                          title={item.title + ' ' + item.type_name}
+-                          poster={item.poster}
+-                          episodes={item.episodes.length}
+-                          source={item.source}
+-                          source_name={item.source_name}
+-                          douban_id={item.douban_id?.toString()}
+-                          query={
+-                            searchQuery.trim() !== item.title
+-                              ? searchQuery.trim()
+-                              : ''
+-                          }
+-                          year={item.year}
+-                          from='search'
+-                          type={item.episodes.length > 1 ? 'tv' : 'movie'}
+-                        />
+-                      </div>
+-                    ))}
++                  : searchResults.map((item) => {
++                      const episodeCount = getEpisodeCount(item);
++                      return (
++                        <div
++                          key={`all-${item.source}-${item.id}`}
++                          className='w-full'
++                        >
++                          <VideoCard
++                            id={item.id}
++                            title={item.title + ' ' + item.type_name}
++                            poster={item.poster}
++                            episodes={episodeCount}
++                            source={item.source}
++                            source_name={item.source_name}
++                            douban_id={item.douban_id?.toString()}
++                            query={
++                              searchQuery.trim() !== item.title
++                                ? searchQuery.trim()
++                                : ''
++                            }
++                            year={item.year}
++                            from='search'
++                            type={episodeCount > 1 ? 'tv' : 'movie'}
++                          />
++                        </div>
++                      );
++                    })}
+                 {searchResults.length === 0 && (
+                   <div className='col-span-full text-center text-gray-500 py-8 dark:text-gray-400'>
+                     未找到相关结果
+@@ -376,7 +380,7 @@ function SearchPageClient() {
+                     >
+                       {item}
+                     </button>
+-                    {/* 删除按钮 */}
++                    {/* 删除按钮：触摸设备始终可见 */}
+                     <button
+                       aria-label='删除搜索历史'
+                       onClick={(e) => {
+@@ -384,7 +388,7 @@ function SearchPageClient() {
+                         e.preventDefault();
+                         deleteSearchHistory(item); // 事件监听会自动更新界面
+                       }}
+-                      className='absolute -top-1 -right-1 w-4 h-4 opacity-0 group-hover:opacity-100 bg-gray-400 hover:bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] transition-colors'
++                      className='absolute -top-1 -right-1 w-4 h-4 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 bg-gray-400 hover:bg-red-500 text-white rounded-full flex items-center justify-center text-[10px] transition-colors'
+                     >
+                       <X className='w-3 h-3' />
+                     </button>
+diff --git a/src/components/EpisodeSelector.tsx b/src/components/EpisodeSelector.tsx
+index 05715d0..948b973 100644
+--- a/src/components/EpisodeSelector.tsx
++++ b/src/components/EpisodeSelector.tsx
+@@ -10,7 +10,11 @@ import React, {
+ } from 'react';
+ 
+ import { SearchResult } from '@/lib/types';
+-import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
++import {
++  getEpisodeCount,
++  getVideoResolutionFromM3u8,
++  processImageUrl,
++} from '@/lib/utils';
+ 
+ // 定义视频信息类型
+ interface VideoInfo {
+@@ -563,9 +567,9 @@ const EpisodeSelector: React.FC<EpisodeSelectorProps> = ({
+                             <span className='text-xs px-2 py-1 border border-gray-500/60 rounded text-gray-700 dark:text-gray-300'>
+                               {source.source_name}
+                             </span>
+-                            {source.episodes.length > 1 && (
++                            {getEpisodeCount(source) > 1 && (
+                               <span className='text-xs text-gray-500 dark:text-gray-400 font-medium'>
+-                                {source.episodes.length} 集
++                                {getEpisodeCount(source)} 集
+                               </span>
+                             )}
+                           </div>
+diff --git a/src/components/ImagePlaceholder.tsx b/src/components/ImagePlaceholder.tsx
+index 8b2f329..ad21522 100644
+--- a/src/components/ImagePlaceholder.tsx
++++ b/src/components/ImagePlaceholder.tsx
+@@ -1,40 +1,6 @@
+-// 图片占位符组件 - 实现骨架屏效果（支持暗色模式）
++// 图片占位符组件 - 骨架屏样式定义在 globals.css
+ const ImagePlaceholder = ({ aspectRatio }: { aspectRatio: string }) => (
+-  <div
+-    className={`w-full ${aspectRatio} rounded-lg`}
+-    style={{
+-      background:
+-        'linear-gradient(90deg, var(--skeleton-color) 25%, var(--skeleton-highlight) 50%, var(--skeleton-color) 75%)',
+-      backgroundSize: '200% 100%',
+-      animation: 'shine 1.5s infinite',
+-    }}
+-  >
+-    <style>{`
+-      @keyframes shine {
+-        0% { background-position: -200% 0; }
+-        100% { background-position: 200% 0; }
+-      }
+-      
+-      /* 亮色模式变量 */
+-      :root {
+-        --skeleton-color: #f0f0f0;
+-        --skeleton-highlight: #e0e0e0;
+-      }
+-      
+-      /* 暗色模式变量 */
+-      @media (prefers-color-scheme: dark) {
+-        :root {
+-          --skeleton-color: #2d2d2d;
+-          --skeleton-highlight: #3d3d3d;
+-        }
+-      }
+-      
+-      .dark {
+-        --skeleton-color: #2d2d2d;
+-        --skeleton-highlight: #3d3d3d;
+-      }
+-    `}</style>
+-  </div>
++  <div className={`image-placeholder w-full ${aspectRatio} rounded-lg`} />
+ );
+ 
+ export { ImagePlaceholder };
+diff --git a/src/components/MobileBottomNav.tsx b/src/components/MobileBottomNav.tsx
+index 8bb188a..3ecea5e 100644
+--- a/src/components/MobileBottomNav.tsx
++++ b/src/components/MobileBottomNav.tsx
+@@ -78,15 +78,11 @@ const MobileBottomNav = ({ activePath }: MobileBottomNavProps) => {
+         minHeight: 'calc(3.5rem + env(safe-area-inset-bottom))',
+       }}
+     >
+-      <ul className='flex items-center overflow-x-auto scrollbar-hide'>
++      <ul className='flex items-center justify-around'>
+         {navItems.map((item) => {
+           const active = isActive(item.href);
+           return (
+-            <li
+-              key={item.href}
+-              className='flex-shrink-0'
+-              style={{ width: '20vw', minWidth: '20vw' }}
+-            >
++            <li key={item.href} className='flex-1 min-w-0'>
+               <Link
+                 href={item.href}
+                 className='flex flex-col items-center justify-center w-full h-14 gap-1 text-xs'
+diff --git a/src/components/PageLayout.tsx b/src/components/PageLayout.tsx
+index a57bb6a..03f22df 100644
+--- a/src/components/PageLayout.tsx
++++ b/src/components/PageLayout.tsx
+@@ -38,13 +38,8 @@ const PageLayout = ({ children, activePath = '/' }: PageLayoutProps) => {
+             <UserMenu />
+           </div>
+ 
+-          {/* 主内容 */}
+-          <main
+-            className='flex-1 md:min-h-0 mb-14 md:mb-0'
+-            style={{
+-              paddingBottom: 'calc(3.5rem + env(safe-area-inset-bottom))',
+-            }}
+-          >
++          {/* 主内容：移动端仅用 mb 为底栏留白，避免与 safe-area 双重叠加 */}
++          <main className='flex-1 md:min-h-0 mb-[calc(3.5rem+env(safe-area-inset-bottom))] md:mb-0'>
+             {children}
+           </main>
+         </div>
+diff --git a/src/components/UserMenu.tsx b/src/components/UserMenu.tsx
+index 260231e..392fabc 100644
+--- a/src/components/UserMenu.tsx
++++ b/src/components/UserMenu.tsx
+@@ -8,6 +8,7 @@ import { useEffect, useState } from 'react';
+ import { createPortal } from 'react-dom';
+ 
+ import { getAuthInfoFromBrowserCookie } from '@/lib/auth';
++import { invalidateImageProxyCache } from '@/lib/utils';
+ import { checkForUpdates, CURRENT_VERSION, UpdateStatus } from '@/lib/version';
+ 
+ interface AuthInfo {
+@@ -236,6 +237,7 @@ export const UserMenu: React.FC = () => {
+     setImageProxyUrl(value);
+     if (typeof window !== 'undefined') {
+       localStorage.setItem('imageProxyUrl', value);
++      invalidateImageProxyCache();
+     }
+   };
+ 
+@@ -250,6 +252,7 @@ export const UserMenu: React.FC = () => {
+     setEnableImageProxy(value);
+     if (typeof window !== 'undefined') {
+       localStorage.setItem('enableImageProxy', JSON.stringify(value));
++      invalidateImageProxyCache();
+     }
+   };
+ 
+@@ -285,6 +288,7 @@ export const UserMenu: React.FC = () => {
+         JSON.stringify(!!defaultImageProxy)
+       );
+       localStorage.setItem('imageProxyUrl', defaultImageProxy);
++      invalidateImageProxyCache();
+     }
+   };
+ 
+diff --git a/src/components/VideoCard.tsx b/src/components/VideoCard.tsx
+index 5f429ac..99ad11b 100644
+--- a/src/components/VideoCard.tsx
++++ b/src/components/VideoCard.tsx
+@@ -3,7 +3,7 @@
+ import { CheckCircle, Heart, Link, PlayCircleIcon } from 'lucide-react';
+ import Image from 'next/image';
+ import { useRouter } from 'next/navigation';
+-import React, { useCallback, useEffect, useMemo, useState } from 'react';
++import React, { memo, useCallback, useEffect, useMemo, useState } from 'react';
+ 
+ import {
+   deleteFavorite,
+@@ -14,7 +14,7 @@ import {
+   subscribeToDataUpdates,
+ } from '@/lib/db.client';
+ import { SearchResult } from '@/lib/types';
+-import { processImageUrl } from '@/lib/utils';
++import { getEpisodeCount, processImageUrl } from '@/lib/utils';
+ 
+ import { ImagePlaceholder } from '@/components/ImagePlaceholder';
+ 
+@@ -37,7 +37,7 @@ interface VideoCardProps {
+   type?: string;
+ }
+ 
+-export default function VideoCard({
++function VideoCard({
+   id,
+   title = '',
+   query = '',
+@@ -69,7 +69,7 @@ export default function VideoCard({
+       if (item.douban_id && item.douban_id !== 0) {
+         countMap.set(item.douban_id, (countMap.get(item.douban_id) || 0) + 1);
+       }
+-      const len = item.episodes?.length || 0;
++      const len = getEpisodeCount(item);
+       if (len > 0) {
+         episodeCountMap.set(len, (episodeCountMap.get(len) || 0) + 1);
+       }
+@@ -107,7 +107,7 @@ export default function VideoCard({
+   const actualYear = aggregateData?.first.year ?? year;
+   const actualQuery = query || '';
+   const actualSearchType = isAggregate
+-    ? aggregateData?.first.episodes?.length === 1
++    ? getEpisodeCount(aggregateData?.first || {}) === 1
+       ? 'movie'
+       : 'tv'
+     : type;
+@@ -281,17 +281,19 @@ export default function VideoCard({
+           src={processImageUrl(actualPoster)}
+           alt={actualTitle}
+           fill
++          sizes='(max-width: 640px) 33vw, 180px'
++          loading='lazy'
+           className='object-cover'
+           referrerPolicy='no-referrer'
+           onLoadingComplete={() => setIsLoading(true)}
+         />
+ 
+-        {/* 悬浮遮罩 */}
+-        <div className='absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent opacity-0 transition-opacity duration-300 ease-in-out group-hover:opacity-100' />
++        {/* 悬浮遮罩：触摸端半透明显示，便于发现可点区域 */}
++        <div className='absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent opacity-40 sm:opacity-0 transition-opacity duration-300 ease-in-out group-hover:opacity-100' />
+ 
+-        {/* 播放按钮 */}
++        {/* 播放按钮：移动端常显弱化图标 */}
+         {config.showPlayButton && (
+-          <div className='absolute inset-0 flex items-center justify-center opacity-0 transition-all duration-300 ease-in-out delay-75 group-hover:opacity-100 group-hover:scale-100'>
++          <div className='absolute inset-0 flex items-center justify-center opacity-70 sm:opacity-0 transition-all duration-300 ease-in-out delay-75 group-hover:opacity-100 group-hover:scale-100'>
+             <PlayCircleIcon
+               size={50}
+               strokeWidth={0.8}
+@@ -300,9 +302,9 @@ export default function VideoCard({
+           </div>
+         )}
+ 
+-        {/* 操作按钮 */}
++        {/* 操作按钮：触摸端始终可见 */}
+         {(config.showHeart || config.showCheckCircle) && (
+-          <div className='absolute bottom-3 right-3 flex gap-3 opacity-0 translate-y-2 transition-all duration-300 ease-in-out group-hover:opacity-100 group-hover:translate-y-0'>
++          <div className='absolute bottom-3 right-3 flex gap-3 opacity-100 translate-y-0 sm:opacity-0 sm:translate-y-2 transition-all duration-300 ease-in-out group-hover:opacity-100 group-hover:translate-y-0'>
+             {config.showCheckCircle && (
+               <CheckCircle
+                 onClick={handleDeleteRecord}
+@@ -339,14 +341,14 @@ export default function VideoCard({
+           </div>
+         )}
+ 
+-        {/* 豆瓣链接 */}
++        {/* 豆瓣链接：触摸端始终可见 */}
+         {config.showDoubanLink && actualDoubanId && (
+           <a
+             href={`https://movie.douban.com/subject/${actualDoubanId}`}
+             target='_blank'
+             rel='noopener noreferrer'
+             onClick={(e) => e.stopPropagation()}
+-            className='absolute top-2 left-2 opacity-0 -translate-x-2 transition-all duration-300 ease-in-out delay-100 group-hover:opacity-100 group-hover:translate-x-0'
++            className='absolute top-2 left-2 opacity-100 translate-x-0 sm:opacity-0 sm:-translate-x-2 transition-all duration-300 ease-in-out delay-100 group-hover:opacity-100 group-hover:translate-x-0'
+           >
+             <div className='bg-green-500 text-white text-xs font-bold w-7 h-7 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
+               <Link size={16} />
+@@ -388,3 +390,5 @@ export default function VideoCard({
+     </div>
+   );
+ }
++
++export default memo(VideoCard);
+diff --git a/src/lib/downstream.ts b/src/lib/downstream.ts
+index 6b84b43..fc4fc0e 100644
+--- a/src/lib/downstream.ts
++++ b/src/lib/downstream.ts
+@@ -15,10 +15,64 @@ interface ApiSearchItem {
+   type_name?: string;
+ }
+ 
++export interface SearchFromApiOptions {
++  /** 浏览搜索：只拉第一页，并精简剧集地址，显著降低延迟与响应体积 */
++  lite?: boolean;
++}
++
++function parseEpisodesFromPlayUrl(vodPlayUrl?: string): string[] {
++  let episodes: string[] = [];
++  if (!vodPlayUrl) return episodes;
++
++  const m3u8Regex = /\$(https?:\/\/[^"'\s]+?\.m3u8)/g;
++  const vod_play_url_array = vodPlayUrl.split('$$$');
++  vod_play_url_array.forEach((url: string) => {
++    const matches = url.match(m3u8Regex) || [];
++    if (matches.length > episodes.length) {
++      episodes = matches;
++    }
++  });
++
++  return Array.from(new Set(episodes)).map((link: string) => {
++    link = link.substring(1); // 去掉开头的 $
++    const parenIndex = link.indexOf('(');
++    return parenIndex > 0 ? link.substring(0, parenIndex) : link;
++  });
++}
++
++function mapApiItemToResult(
++  item: ApiSearchItem,
++  apiSite: ApiSite,
++  apiName: string,
++  lite: boolean
++): SearchResult {
++  const episodes = parseEpisodesFromPlayUrl(item.vod_play_url);
++  const episode_count = episodes.length;
++
++  return {
++    id: item.vod_id.toString(),
++    title: item.vod_name.trim().replace(/\s+/g, ' '),
++    poster: item.vod_pic,
++    // lite：列表页只需集数，播放地址走 /api/detail
++    episodes: lite ? [] : episodes,
++    episode_count,
++    source: apiSite.key,
++    source_name: apiName,
++    class: item.vod_class,
++    year: item.vod_year ? item.vod_year.match(/\d{4}/)?.[0] || '' : 'unknown',
++    desc: lite ? '' : cleanHtmlTags(item.vod_content || ''),
++    type_name: item.type_name,
++    douban_id: item.vod_douban_id,
++  };
++}
++
+ export async function searchFromApi(
+   apiSite: ApiSite,
+-  query: string
++  query: string,
++  options: SearchFromApiOptions = {}
+ ): Promise<SearchResult[]> {
++  const lite = options.lite === true;
++
+   try {
+     const apiBaseUrl = apiSite.api;
+     const apiUrl =
+@@ -50,45 +104,14 @@ export async function searchFromApi(
+       return [];
+     }
+     // 处理第一页结果
+-    const results = data.list.map((item: ApiSearchItem) => {
+-      let episodes: string[] = [];
+-
+-      // 使用正则表达式从 vod_play_url 提取 m3u8 链接
+-      if (item.vod_play_url) {
+-        const m3u8Regex = /\$(https?:\/\/[^"'\s]+?\.m3u8)/g;
+-        // 先用 $$$ 分割
+-        const vod_play_url_array = item.vod_play_url.split('$$$');
+-        // 对每个分片做匹配，取匹配到最多的作为结果
+-        vod_play_url_array.forEach((url: string) => {
+-          const matches = url.match(m3u8Regex) || [];
+-          if (matches.length > episodes.length) {
+-            episodes = matches;
+-          }
+-        });
+-      }
+-
+-      episodes = Array.from(new Set(episodes)).map((link: string) => {
+-        link = link.substring(1); // 去掉开头的 $
+-        const parenIndex = link.indexOf('(');
+-        return parenIndex > 0 ? link.substring(0, parenIndex) : link;
+-      });
++    const results: SearchResult[] = data.list.map((item: ApiSearchItem) =>
++      mapApiItemToResult(item, apiSite, apiName, lite)
++    );
+ 
+-      return {
+-        id: item.vod_id.toString(),
+-        title: item.vod_name.trim().replace(/\s+/g, ' '),
+-        poster: item.vod_pic,
+-        episodes,
+-        source: apiSite.key,
+-        source_name: apiName,
+-        class: item.vod_class,
+-        year: item.vod_year
+-          ? item.vod_year.match(/\d{4}/)?.[0] || ''
+-          : 'unknown',
+-        desc: cleanHtmlTags(item.vod_content || ''),
+-        type_name: item.type_name,
+-        douban_id: item.vod_douban_id,
+-      };
+-    });
++    // lite 模式只取第一页，优先返回结果
++    if (lite) {
++      return results;
++    }
+ 
+     const config = await getConfig();
+     const MAX_SEARCH_PAGES: number = config.SiteConfig.SearchDownstreamMaxPage;
+@@ -131,37 +154,9 @@ export async function searchFromApi(
+             if (!pageData || !pageData.list || !Array.isArray(pageData.list))
+               return [];
+ 
+-            return pageData.list.map((item: ApiSearchItem) => {
+-              let episodes: string[] = [];
+-
+-              // 使用正则表达式从 vod_play_url 提取 m3u8 链接
+-              if (item.vod_play_url) {
+-                const m3u8Regex = /\$(https?:\/\/[^"'\s]+?\.m3u8)/g;
+-                episodes = item.vod_play_url.match(m3u8Regex) || [];
+-              }
+-
+-              episodes = Array.from(new Set(episodes)).map((link: string) => {
+-                link = link.substring(1); // 去掉开头的 $
+-                const parenIndex = link.indexOf('(');
+-                return parenIndex > 0 ? link.substring(0, parenIndex) : link;
+-              });
+-
+-              return {
+-                id: item.vod_id.toString(),
+-                title: item.vod_name.trim().replace(/\s+/g, ' '),
+-                poster: item.vod_pic,
+-                episodes,
+-                source: apiSite.key,
+-                source_name: apiName,
+-                class: item.vod_class,
+-                year: item.vod_year
+-                  ? item.vod_year.match(/\d{4}/)?.[0] || ''
+-                  : 'unknown',
+-                desc: cleanHtmlTags(item.vod_content || ''),
+-                type_name: item.type_name,
+-                douban_id: item.vod_douban_id,
+-              };
+-            });
++            return pageData.list.map((item: ApiSearchItem) =>
++              mapApiItemToResult(item, apiSite, apiName, false)
++            );
+           } catch (error) {
+             return [];
+           }
+@@ -257,6 +252,7 @@ export async function getDetailFromApi(
+     title: videoDetail.vod_name,
+     poster: videoDetail.vod_pic,
+     episodes,
++    episode_count: episodes.length,
+     source: apiSite.key,
+     source_name: apiSite.name,
+     class: videoDetail.vod_class,
+@@ -333,6 +329,7 @@ async function handleSpecialSourceDetail(
+     title: titleText,
+     poster: coverUrl,
+     episodes: matches,
++    episode_count: matches.length,
+     source: apiSite.key,
+     source_name: apiSite.name,
+     class: '',
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index a3abc8d..08952cd 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -87,6 +87,8 @@ export interface SearchResult {
+   title: string;
+   poster: string;
+   episodes: string[];
++  /** 精简搜索时返回的集数，避免下发完整播放地址列表 */
++  episode_count?: number;
+   source: string;
+   source_name: string;
+   class?: string;
+diff --git a/src/lib/utils.ts b/src/lib/utils.ts
+index cc5152c..7122dc5 100644
+--- a/src/lib/utils.ts
++++ b/src/lib/utils.ts
+@@ -1,7 +1,5 @@
+ /* eslint-disable @typescript-eslint/no-explicit-any,no-console */
+ 
+-import Hls from 'hls.js';
+-
+ /**
+  * 获取图片代理 URL 设置
+  */
+@@ -28,13 +26,29 @@ export function getImageProxyUrl(): string | null {
+     : null;
+ }
+ 
++/** 缓存图片代理前缀，避免每个卡片反复读 localStorage */
++let cachedImageProxyUrl: string | null | undefined;
++
++function getCachedImageProxyUrl(): string | null {
++  if (typeof window === 'undefined') return null;
++  if (cachedImageProxyUrl === undefined) {
++    cachedImageProxyUrl = getImageProxyUrl();
++  }
++  return cachedImageProxyUrl;
++}
++
++/** 图片代理设置变更时调用，清空缓存 */
++export function invalidateImageProxyCache(): void {
++  cachedImageProxyUrl = undefined;
++}
++
+ /**
+  * 处理图片 URL，如果设置了图片代理则使用代理
+  */
+ export function processImageUrl(originalUrl: string): string {
+   if (!originalUrl) return originalUrl;
+ 
+-  const proxyUrl = getImageProxyUrl();
++  const proxyUrl = getCachedImageProxyUrl();
+   if (!proxyUrl) return originalUrl;
+ 
+   return `${proxyUrl}${encodeURIComponent(originalUrl)}`;
+@@ -90,15 +104,29 @@ export function cleanHtmlTags(text: string): string {
+ }
+ 
+ /**
+- * 从m3u8地址获取视频质量等级和网络信息
+- * @param m3u8Url m3u8播放列表的URL
+- * @returns Promise<{quality: string, loadSpeed: string, pingTime: number}> 视频质量等级和网络信息
++ * 获取剧集数量（兼容精简搜索结果）
++ */
++export function getEpisodeCount(item: {
++  episodes?: string[];
++  episode_count?: number;
++}): number {
++  if (typeof item.episode_count === 'number' && item.episode_count >= 0) {
++    return item.episode_count;
++  }
++  return item.episodes?.length ?? 0;
++}
++
++/**
++ * 从 m3u8 地址获取视频质量等级和网络信息。
++ * 动态加载 hls.js，避免列表页打包进播放器依赖。
+  */
+ export async function getVideoResolutionFromM3u8(m3u8Url: string): Promise<{
+   quality: string; // 如720p、1080p等
+   loadSpeed: string; // 自动转换为KB/s或MB/s
+   pingTime: number; // 网络延迟（毫秒）
+ }> {
++  const Hls = (await import('hls.js')).default;
++
+   try {
+     // 直接使用m3u8 URL作为视频源，避免CORS问题
+     return new Promise((resolve, reject) => {
+diff --git a/src/lib/version.ts b/src/lib/version.ts
+index ff14020..c0f58f5 100644
+--- a/src/lib/version.ts
++++ b/src/lib/version.ts
+@@ -2,7 +2,7 @@
+ 
+ 'use client';
+ 
+-const CURRENT_VERSION = '20250804231933';
++const CURRENT_VERSION = '20260727074636';
+ 
+ // 版本检查结果枚举
+ export enum UpdateStatus {
+-- 
+2.43.0
+
